@@ -386,27 +386,10 @@ class SystemdScopeOwner implements BoundProcessOwner {
     return true
   }
 
-  /**
-   * Prove an active unit with no processes is the empty managed range rather
-   * than a launch still placing its payload. systemd ends a scope only on the
-   * populated-to-empty transition, so a payload killed before it entered the
-   * cgroup leaves the unit active forever. A departed client cannot add another
-   * payload; a consumed request proves the payload already entered the scope,
-   * even while its direct-process exit notification is pending.
-   */
-  private emptyRange(tasksCurrent: number | undefined): boolean {
-    return this.terminationRequested && tasksCurrent === 0
-      && (!this.direct.running() || !existsSync(this.startup.files.requestPath))
-  }
-
-  /** Release a leftover empty scope so the transient unit is collected and cannot accumulate. */
-  private releaseEmptyRange(): void {
+  /** Request collection of a scope that the manager left active after it emptied. */
+  private async releaseEmptyRange(): Promise<void> {
     try {
-      this.runSync(this.systemctl, ['--user', 'stop', this.unit], {
-        env: managerEnvironment(),
-        stdio: 'ignore',
-        timeout: SYSTEMCTL_TIMEOUT_MS,
-      })
+      await this.query(this.systemctl, ['--user', 'stop', '--no-block', this.unit])
     } catch (_scopeStopFailed) {
       // The range is already empty; a failed cleanup leaves only the transient unit.
     }
@@ -449,6 +432,10 @@ class SystemdScopeOwner implements BoundProcessOwner {
     this.observeRequestConsumption()
     const generation = this.wakeGeneration
     const directRunning = this.direct.running()
+    // An empty count is stale if the launcher could still enter the scope when
+    // queried. During cancellation, a consumed request proves it already entered.
+    const canReleaseEmptyRange = !directRunning
+      || (this.terminationRequested && !existsSync(this.startup.files.requestPath))
     const result = await this.query(this.systemctl, [
       '--user',
       'show',
@@ -473,8 +460,8 @@ class SystemdScopeOwner implements BoundProcessOwner {
       if (!['active', 'activating', 'reloading', 'deactivating'].includes(activeState)) {
         throw new Error(`systemctl returned unknown ActiveState for ${this.unit}: ${JSON.stringify(activeState)}`)
       }
-      if (this.emptyRange(tasksCurrent)) {
-        this.releaseEmptyRange()
+      if (canReleaseEmptyRange && tasksCurrent === 0) {
+        await this.releaseEmptyRange()
         return false
       }
       if (this.killFailure !== undefined) {

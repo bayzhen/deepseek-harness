@@ -138,10 +138,13 @@ function launch(
   })
   const spawnSync = vi.fn(() => ({ status: 0, stdout: '', stderr: '' }))
   const systemctlQuery = overrides.systemctlQuery ?? query
+  const stopScope = vi.fn(async (_command: string, _args: readonly string[]) => ({ status: 0, stdout: '', stderr: '' }))
+  const runSystemctl: LinuxScopeInternals['systemctlQuery'] = systemctlQuery === undefined ? undefined :
+    (command, args) => args[1] === 'stop' ? stopScope(command, args) : systemctlQuery(command, args)
   const result = launchLinuxScope(request, { TARGET: 'yes' }, ['--expand-environment=no'], {
     spawn: overrides.spawn ?? spawn as never,
     spawnSync: overrides.spawnSync ?? spawnSync as never,
-    ...systemctlQuery === undefined ? {} : { systemctlQuery },
+    ...runSystemctl === undefined ? {} : { systemctlQuery: runSystemctl },
     systemdRun: overrides.systemdRun ?? '/bin/systemd-run',
     systemctl: overrides.systemctl ?? '/bin/systemctl',
     runnerInvocation: overrides.runnerInvocation ?? ['/usr/bin/node', '/runner.js'],
@@ -152,7 +155,7 @@ function launch(
   const requestPath = options?.env?.[SUBPROCESS_RUNNER_ENV]
   if (requestPath === undefined) throw new Error('launch did not publish a request locator')
   directories.push(linuxLaunchFilesFromLocator(requestPath).directory)
-  return { child, result, requestPath, spawn, spawnSync, options }
+  return { child, result, requestPath, spawn, spawnSync, stopScope, options }
 }
 
 describe('Linux native capability selection', () => {
@@ -656,7 +659,8 @@ describe('Linux scope establishment and quiescence', () => {
     launched.child.exit(null, 'SIGKILL')
     await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
     await expect(launched.result.direct).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' })
-    expect(spawnSync.mock.calls.map(call => call[1]?.[1])).toEqual(['kill', 'stop'])
+    expect(spawnSync.mock.calls.map(call => call[1]?.[1])).toEqual(['kill'])
+    expect(launched.stopScope).toHaveBeenCalledOnce()
     launched.result.owner.cleanup?.()
   })
 
@@ -844,7 +848,8 @@ describe('Linux scope establishment and quiescence', () => {
       await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
       expect(launched.child.exitCode).toBeNull()
       expect(launched.child.signalCode).toBeNull()
-      expect(spawnSync.mock.calls.map(call => call[1]?.[1])).toEqual(['kill', 'stop'])
+      expect(spawnSync.mock.calls.map(call => call[1]?.[1])).toEqual(['kill'])
+      expect(launched.stopScope).toHaveBeenCalledOnce()
     } finally {
       launched.child.exit(null, 'SIGKILL')
       await launched.result.direct
@@ -928,17 +933,17 @@ describe('Linux scope establishment and quiescence', () => {
     await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
     expect(spawnSync.mock.calls.map(call => call[1])).toEqual([
       ['--user', 'kill', '--kill-who=all', '--signal=SIGKILL', expect.stringMatching(/\.scope$/u)],
-      ['--user', 'stop', expect.stringMatching(/\.scope$/u)],
+    ])
+    expect(launched.stopScope).toHaveBeenCalledExactlyOnceWith('/bin/systemctl', [
+      '--user', 'stop', '--no-block', expect.stringMatching(/\.scope$/u),
     ])
     launched.result.owner.cleanup?.()
   })
 
   it('concludes the empty range even when releasing the leftover scope fails', async () => {
     denyProcessGroups()
-    const spawnSync = recordingSystemctl()
-      .mockImplementationOnce(() => ({ status: 0, stdout: '', stderr: '' }))
-      .mockImplementationOnce(() => { throw new Error('systemctl is gone') })
-    const launched = launch(async () => activeUnitWithTasks('0'), { spawnSync: spawnSync as never })
+    const launched = launch(async () => activeUnitWithTasks('0'))
+    launched.stopScope.mockRejectedValueOnce(new Error('systemctl is gone'))
     launched.result.owner.signal('SIGKILL')
     launched.child.exit(null, 'SIGKILL')
     await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
@@ -955,22 +960,59 @@ describe('Linux scope establishment and quiescence', () => {
     launched.result.owner.signal('SIGTERM')
     await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
     expect(spawnSync.mock.calls.map(call => call[1]?.[1])).toEqual(['kill'])
+    expect(launched.stopScope).not.toHaveBeenCalled()
     launched.result.owner.cleanup?.()
   })
 
-  it('keeps waiting for an active empty scope no termination has requested', async () => {
+  it('keeps waiting for an active empty scope while its launcher can still enter it', async () => {
     const states = [activeUnitWithTasks('0'), unloadedUnit()]
     const launched = launch(async () => states.shift() ?? unloadedUnit())
     await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
-    expect(launched.spawnSync).not.toHaveBeenCalled()
+    expect(launched.stopScope).not.toHaveBeenCalled()
+    launched.result.owner.cleanup?.()
+  })
+
+  it('releases a still-active empty scope after ordinary command exit', async () => {
+    const query = vi.fn(async () => activeUnitWithTasks('0'))
+    const sleep = vi.fn(async () => { throw new Error('the empty scope should be released immediately') })
+    const launched = launch(query, { sleep })
+    consumeLinuxLaunchRequest(launched.requestPath)
+    launched.child.exit(0, null)
+    await expect(launched.result.direct).resolves.toEqual({ exitCode: 0, signal: null })
+    await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
+    expect(launched.stopScope).toHaveBeenCalledOnce()
+    expect(sleep).not.toHaveBeenCalled()
+    launched.result.owner.cleanup?.()
+  })
+
+  it('queries again when the launcher exits during an empty-scope query', async () => {
+    const beforeExit = Promise.withResolvers<ReturnType<typeof activeUnitWithTasks>>()
+    const query = vi.fn<NonNullable<LinuxScopeInternals['systemctlQuery']>>(async () => {
+      throw new Error('the fresh empty scope should be released')
+    })
+      .mockImplementationOnce(() => beforeExit.promise)
+      .mockResolvedValueOnce(activeUnitWithTasks('1'))
+      .mockResolvedValueOnce(activeUnitWithTasks('0'))
+    const sleep = vi.fn(async () => {})
+    const launched = launch(query, { sleep })
+    const waiting = launched.result.owner.waitForExit()
+    consumeLinuxLaunchRequest(launched.requestPath)
+    launched.child.exit(0, null)
+    beforeExit.resolve(activeUnitWithTasks('0'))
+    await expect(waiting).resolves.toBeUndefined()
+    expect(query).toHaveBeenCalledTimes(3)
+    expect(sleep).toHaveBeenCalledTimes(2)
+    expect(launched.stopScope).toHaveBeenCalledOnce()
     launched.result.owner.cleanup?.()
   })
 
   it('treats an unset process count as unknown and keeps waiting', async () => {
     const states = [activeUnitWithTasks('[not set]'), unloadedUnit()]
     const launched = launch(async () => states.shift() ?? unloadedUnit())
+    consumeLinuxLaunchRequest(launched.requestPath)
+    launched.child.exit(0, null)
     await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
-    expect(launched.spawnSync).not.toHaveBeenCalled()
+    expect(launched.stopScope).not.toHaveBeenCalled()
     launched.result.owner.cleanup?.()
   })
 
